@@ -1,6 +1,0 @@
-{
-  "name": "Literary Vocabulary Register",
-  "description": "A literary vocabulary register with dictionary & image lookups, multi-provider AI context enhancement, interactive fantasy map cartography, floating YouTube & playlist player, and liquid marine interface.",
-  "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
-}
