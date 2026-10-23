@@ -1671,6 +1671,7 @@
       <span id="yw-title" class="yw-title">YouTube</span>
     </div>
     <div class="yw-header-actions">
+      <button type="button" id="yw-downloads-btn" class="icon-btn" title="Download playing video (all resolutions / desired format, save to local folder &amp; 'Downloaded' playlist)" aria-label="Download playing video" aria-haspopup="true" aria-expanded="false" aria-pressed="false" data-compact-key="downloads">⬇</button>
       <div class="yw-volume-control" id="yw-volume-control" data-compact-key="volume">
         <button type="button" id="yw-mute-btn" class="icon-btn" title="Mute" aria-label="Mute" aria-pressed="false">🔊</button>
         <input type="range" id="yw-volume-slider" class="yw-volume-slider" min="0" max="100" step="1" value="100" aria-label="YouTube volume" title="Volume">
@@ -1678,7 +1679,6 @@
       <button type="button" id="yw-loop-btn" class="icon-btn" title="Loop this video: off" aria-pressed="false" aria-label="Loop this video" data-compact-key="loop">🔁</button>
       <button type="button" id="yw-local-media-btn" class="icon-btn" title="Open local video or audio file" aria-label="Open local video or audio file" data-compact-key="local">📂</button>
       <input type="file" id="yw-local-file-input" class="hidden" accept="video/*,audio/*" multiple>
-      <button type="button" id="yw-downloads-btn" class="icon-btn" title="Authorized Media Downloads &amp; Local Library" aria-label="Authorized Media Downloads and Local Library" aria-pressed="false" data-compact-key="downloads">⬇</button>
       <button type="button" id="yw-open-external-btn" class="icon-btn" title="Open on YouTube.com — for Like, Subscribe, Save, Download, and everything else only Google's own site can do" aria-label="Open this video on YouTube.com" disabled data-compact-key="external">↗</button>
       <!-- Playlist Part 2B1 — "+ Add to Playlist" for whatever's currently
            playing. Wrapped in a position:relative div so the picker
@@ -1784,6 +1784,7 @@
         <p class="yw-settings-label yw-compact-sublabel">Header buttons allowed in compact mode</p>
         <p class="yw-settings-hint">Ticked buttons appear right next to ⚙ when you hover the header. Unticked ones stay tucked away — use the quick actions below instead.</p>
         <div class="yw-compact-tick-list" id="yw-compact-tick-list">
+          <label class="yw-compact-tick"><input type="checkbox" data-compact-tick="downloads" checked><span>⬇ Download Video</span></label>
           <label class="yw-compact-tick"><input type="checkbox" data-compact-tick="volume" checked><span>🔊 Volume</span></label>
           <label class="yw-compact-tick"><input type="checkbox" data-compact-tick="loop" checked><span>🔁 Loop</span></label>
           <label class="yw-compact-tick"><input type="checkbox" data-compact-tick="external" checked><span>↗ Open on YouTube.com</span></label>
@@ -1832,6 +1833,7 @@
     <p id="yw-api-key-status" class="yw-settings-hint hidden"></p>
     <div id="yw-quota-status" class="yw-quota-status" aria-live="polite"></div>
   </div>
+  <div id="yw-download-popover" class="yw-download-popover hidden" role="dialog" aria-label="Download playing video"></div>
 
   <div class="yw-body" id="yw-body">
     <div id="yw-video-wrap" class="yw-video-wrap hidden">
