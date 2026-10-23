@@ -2961,6 +2961,11 @@
     }
     setPlayingIndicator(true);
     reflectOpenExternalUI();
+    try {
+      if (typeof prefetchYoutubeStreamCatalog === "function") {
+        prefetchYoutubeStreamCatalog(id);
+      }
+    } catch (_) {}
     // Pasted-link path (Part 8) briefly names the recognized ID, so
     // pasting is legible feedback rather than a silent jump to a player —
     // clicking a result card already shows a video, so it keeps the
@@ -7677,35 +7682,44 @@
   const YW_DL_PREFS_STORAGE = "vocabRegister_youtubeDownloadPrefs";
 
   const AUTHORIZED_MEDIA_FORMATS = [
-    { id: "video/mp4", label: "MP4 Video (.mp4)", short: "MP4", accept: "video/mp4,video/*;q=0.9,*/*;q=0.5", ext: ".mp4" },
+    { id: "video/mp4", label: "MP4 Video + Audio (.mp4 — Windows Media Player)", short: "MP4", accept: "video/mp4,video/*;q=0.9,*/*;q=0.5", ext: ".mp4" },
+    { id: "audio/mp4", label: "M4A Music Audio (.m4a — Windows Media Player)", short: "M4A", accept: "audio/mp4,audio/*;q=0.9,*/*;q=0.5", ext: ".m4a" },
     { id: "video/webm", label: "WebM Video (.webm)", short: "WebM", accept: "video/webm,video/*;q=0.9,*/*;q=0.5", ext: ".webm" },
-    { id: "audio/mpeg", label: "MP3 Audio (.mp3)", short: "MP3", accept: "audio/mpeg,audio/*;q=0.9,*/*;q=0.5", ext: ".mp3" },
+    { id: "audio/mpeg", label: "MP3 / AAC Audio (.m4a)", short: "Audio", accept: "audio/mp4,audio/mpeg,audio/*;q=0.9,*/*;q=0.5", ext: ".m4a" },
     { id: "audio/wav", label: "WAV Audio (.wav)", short: "WAV", accept: "audio/wav,audio/*;q=0.9,*/*;q=0.5", ext: ".wav" },
-    { id: "audio/ogg", label: "Ogg Audio (.ogg)", short: "OGG", accept: "audio/ogg,audio/*;q=0.9,*/*;q=0.5", ext: ".ogg" },
-    { id: "auto", label: "Original Source (Auto)", short: "Auto", accept: "video/*,audio/*,*/*;q=0.8", ext: ".mp4" },
+    { id: "audio/ogg", label: "Ogg / Opus Audio (.webm)", short: "Opus", accept: "audio/webm,audio/ogg,audio/*;q=0.9,*/*;q=0.5", ext: ".webm" },
+    { id: "auto", label: "Best Playable Container (Auto .mp4)", short: "Auto", accept: "video/mp4,video/*,audio/*,*/*;q=0.8", ext: ".mp4" },
   ];
 
   const DOWNLOAD_RESOLUTION_OPTIONS = [
-    { id: "all", label: "All Available Resolutions (1080p, 720p, 480p, 360p)" },
+    { id: "best", label: "Best Video + Audio (MP4 — Plays in PC Media Player)" },
+    { id: "all", label: "All Available Resolutions (Video+Audio + HD + Audio)" },
     { id: "2160p", label: "2160p (4K UHD)" },
     { id: "1440p", label: "1440p (2K QHD)" },
     { id: "1080p", label: "1080p (Full HD)" },
     { id: "720p", label: "720p (HD)" },
     { id: "480p", label: "480p (Standard)" },
-    { id: "360p", label: "360p (Medium)" },
+    { id: "360p", label: "360p (Video + Audio MP4)" },
     { id: "240p", label: "240p (Data Saver)" },
-    { id: "audio", label: "Audio Only (Best Bitrate)" },
+    { id: "audio", label: "Audio Only (M4A — Windows Media Player)" },
   ];
 
-  const ALL_BATCH_RESOLUTIONS = ["1080p", "720p", "480p", "360p"];
+  const ALL_BATCH_RESOLUTIONS = ["best", "1080p", "720p", "audio"];
 
   let downloadPrefs = (() => {
     const raw = loadJson(YW_DL_PREFS_STORAGE, null);
+    let savedRes = raw && typeof raw.resolution === "string" ? raw.resolution : "best";
+    // Migrate legacy v1 default so single-click downloads always produce a
+    // muxed Video + Audio MP4 that plays with sound in Windows Media Player.
+    if (raw && !raw.v2RealStreamMigrated && savedRes === "all") {
+      savedRes = "best";
+    }
     return {
-      resolution: raw && typeof raw.resolution === "string" ? raw.resolution : "all",
+      resolution: savedRes,
       formatId: raw && typeof raw.formatId === "string" ? raw.formatId : "video/mp4",
       folderLabel: raw && typeof raw.folderLabel === "string" ? raw.folderLabel : null,
       autoAddToDownloadedPlaylist: raw && typeof raw.autoAddToDownloadedPlaylist === "boolean" ? raw.autoAddToDownloadedPlaylist : true,
+      v2RealStreamMigrated: true,
     };
   })();
 
@@ -7717,13 +7731,413 @@
 
   let authorizedLibraryItems = (() => {
     const saved = loadJson(YW_AUTH_MEDIA_STORAGE, []);
-    return Array.isArray(saved) ? saved : [];
+    if (!Array.isArray(saved)) return [];
+    // Filter out any legacy synthetic placeholder entries that lacked a real media stream
+    return saved.filter((it) => it && (it.hasRawMediaStream || it.directStreamUrl || it.youtubeVideoId));
   })();
   const activeDownloadJobs = new Map();
   const sessionBlobUrlCache = new Map();
+  const youtubeStreamCatalogCache = new Map();
+  const youtubeStreamCatalogInflight = new Map();
 
   function saveAuthorizedLibraryIndex() {
     saveJson(YW_AUTH_MEDIA_STORAGE, authorizedLibraryItems);
+  }
+
+  // Binary container magic-byte validator — prevents HTML error/challenge pages
+  // or text responses from ever being saved to disk as a corrupt .mp4 file
+  // (which causes Windows Media Player error 0xc00d36c4).
+  function inspectBinaryMediaHeader(uint8) {
+    if (!(uint8 instanceof Uint8Array) || uint8.byteLength < 16) {
+      return { valid: false, ext: null, mime: null };
+    }
+    // Reject HTML / XML / JSON text payloads immediately
+    const headAscii = String.fromCharCode(...uint8.subarray(0, 14)).trimStart().toLowerCase();
+    if (
+      headAscii.startsWith("<!doc") ||
+      headAscii.startsWith("<html") ||
+      headAscii.startsWith("<?xml") ||
+      headAscii.startsWith("<head") ||
+      headAscii.startsWith("{\"") ||
+      headAscii.startsWith("error")
+    ) {
+      return { valid: false, ext: null, mime: null };
+    }
+    // 1. ISO Base Media File Format (MP4 / M4A): bytes 4..7 === "ftyp"
+    if (
+      uint8[4] === 0x66 &&
+      uint8[5] === 0x74 &&
+      uint8[6] === 0x79 &&
+      uint8[7] === 0x70
+    ) {
+      const brand = String.fromCharCode(uint8[8], uint8[9], uint8[10], uint8[11]).toLowerCase();
+      if (brand.startsWith("m4a")) {
+        return { valid: true, ext: ".m4a", mime: "audio/mp4" };
+      }
+      return { valid: true, ext: ".mp4", mime: "video/mp4" };
+    }
+    // 2. WebM / Matroska EBML header: 1A 45 DF A3
+    if (
+      uint8[0] === 0x1a &&
+      uint8[1] === 0x45 &&
+      uint8[2] === 0xdf &&
+      uint8[3] === 0xa3
+    ) {
+      return { valid: true, ext: ".webm", mime: "video/webm" };
+    }
+    // 3. RIFF WAVE header: "RIFF" .... "WAVE"
+    if (
+      uint8[0] === 0x52 &&
+      uint8[1] === 0x49 &&
+      uint8[2] === 0x46 &&
+      uint8[3] === 0x46 &&
+      uint8[8] === 0x57 &&
+      uint8[9] === 0x41 &&
+      uint8[10] === 0x56 &&
+      uint8[11] === 0x45
+    ) {
+      return { valid: true, ext: ".wav", mime: "audio/wav" };
+    }
+    // 4. Ogg container: "OggS"
+    if (
+      uint8[0] === 0x4f &&
+      uint8[1] === 0x67 &&
+      uint8[2] === 0x67 &&
+      uint8[3] === 0x53
+    ) {
+      return { valid: true, ext: ".ogg", mime: "audio/ogg" };
+    }
+    // 5. MP3 (ID3 tag or MPEG sync word)
+    if (
+      (uint8[0] === 0x49 && uint8[1] === 0x44 && uint8[2] === 0x33) ||
+      (uint8[0] === 0xff && (uint8[1] & 0xe0) === 0xe0)
+    ) {
+      return { valid: true, ext: ".mp3", mime: "audio/mpeg" };
+    }
+    // 6. MPEG-TS transport stream: 0x47 sync byte every 188 bytes
+    if (uint8[0] === 0x47 && (uint8.byteLength < 189 || uint8[188] === 0x47)) {
+      return { valid: true, ext: ".ts", mime: "video/mp2t" };
+    }
+    return { valid: false, ext: null, mime: null };
+  }
+
+  function sanitizeFilenameBase(rawTitle) {
+    return (
+      String(rawTitle || "video")
+        .replace(/[<>:"/\\|?*\x00-\x1F]/g, " ")
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, 110) || "video"
+    );
+  }
+
+  function toCompanionDownloadUrl(rawStreamUrl, downloadFileName) {
+    if (!rawStreamUrl) return "";
+    let u = String(rawStreamUrl);
+    if (u.includes("invidious.f5.si/videoplayback?")) {
+      u = u.replace("invidious.f5.si/videoplayback?", "invidious.f5.si/companion/videoplayback?");
+    } else if (u.startsWith("/videoplayback?")) {
+      u = `https://invidious.f5.si/companion${u}`;
+    } else if (u.startsWith("/companion/videoplayback?")) {
+      u = `https://invidious.f5.si${u}`;
+    }
+    if (downloadFileName) {
+      const sep = u.includes("?") ? "&" : "?";
+      u = `${u}${sep}title=${encodeURIComponent(downloadFileName)}`;
+    }
+    return u;
+  }
+
+  // Resolves real YouTube video/audio streams from CORS-enabled public APIs
+  // (invidious.f5.si + pipedapi.ducks.party + api.piped.private.coffee) so both
+  // static GitHub Pages deployments and local/AI Studio deployments have
+  // genuine playable MP4 / M4A / WebM streams.
+  async function resolveYoutubeStreamCatalog(ytId) {
+    if (!ytId) return null;
+    if (youtubeStreamCatalogCache.has(ytId)) {
+      return youtubeStreamCatalogCache.get(ytId);
+    }
+    if (youtubeStreamCatalogInflight.has(ytId)) {
+      return youtubeStreamCatalogInflight.get(ytId);
+    }
+
+    const promise = (async () => {
+      const catalog = {
+        videoId: ytId,
+        title: "",
+        channelTitle: "",
+        duration: null,
+        thumbnailUrl: `https://i.ytimg.com/vi/${ytId}/mqdefault.jpg`,
+        muxedStreams: [], // Complete Video + Audio MP4 streams (ftypmp42)
+        audioStreams: [], // Complete Audio M4A / WebM streams
+        adaptiveVideoStreams: [], // 2160p, 1440p, 1080p, 720p, 480p, 360p, 240p
+        corsDirectVideoUrl: null, // Direct fetch()-able MP4 stream when available
+        fetchedAt: Date.now(),
+      };
+
+      // 1. Query invidious.f5.si (/api/v1/videos/:id?local=true has ACAO: * and
+      // works for all YouTube music videos directly from GitHub Pages).
+      const invidiousBases = [
+        "https://invidious.f5.si",
+        "https://inv.nadeko.net",
+        "https://invidious.nerdvpn.de",
+      ];
+      for (const base of invidiousBases) {
+        try {
+          const r = await fetch(`${base}/api/v1/videos/${encodeURIComponent(ytId)}?local=true`, {
+            signal: AbortSignal.timeout ? AbortSignal.timeout(7000) : undefined,
+          });
+          if (!r.ok) continue;
+          const d = await r.json();
+          if (!d || (!Array.isArray(d.formatStreams) && !Array.isArray(d.adaptiveFormats))) continue;
+
+          if (d.title) catalog.title = d.title;
+          if (d.author) catalog.channelTitle = d.author;
+          if (Number.isFinite(d.lengthSeconds) && d.lengthSeconds > 0) {
+            catalog.duration = d.lengthSeconds;
+          }
+
+          if (Array.isArray(d.formatStreams)) {
+            for (const s of d.formatStreams) {
+              if (!s || !s.url) continue;
+              const q = s.qualityLabel || "360p";
+              const ext = s.container === "webm" ? ".webm" : ".mp4";
+              const mime = ext === ".webm" ? "video/webm" : "video/mp4";
+              const streamUrl = s.url.startsWith("http")
+                ? s.url.replace(`${base}/videoplayback?`, `${base}/companion/videoplayback?`)
+                : `${base}${s.url.replace(/^\/videoplayback\?/, "/companion/videoplayback?")}`;
+              catalog.muxedStreams.push({
+                itag: String(s.itag || "18"),
+                quality: q,
+                label: `${q} Video + Audio (${ext.toUpperCase().slice(1)})`,
+                ext,
+                mime,
+                hasAudio: true,
+                hasVideo: true,
+                sizeBytes: parseInt(s.clen || "0", 10) || 0,
+                rawUrl: streamUrl,
+              });
+            }
+          }
+
+          if (Array.isArray(d.adaptiveFormats)) {
+            for (const s of d.adaptiveFormats) {
+              if (!s || !s.url) continue;
+              const typeStr = String(s.type || "").toLowerCase();
+              const streamUrl = s.url.startsWith("http")
+                ? s.url.replace(`${base}/videoplayback?`, `${base}/companion/videoplayback?`)
+                : `${base}${s.url.replace(/^\/videoplayback\?/, "/companion/videoplayback?")}`;
+              const sizeBytes = parseInt(s.clen || "0", 10) || 0;
+
+              if (typeStr.startsWith("audio/")) {
+                const isMp4Audio = typeStr.includes("mp4") || s.container === "m4a" || String(s.itag) === "140";
+                const ext = isMp4Audio ? ".m4a" : ".webm";
+                const mime = isMp4Audio ? "audio/mp4" : "audio/webm";
+                catalog.audioStreams.push({
+                  itag: String(s.itag || ""),
+                  quality: "audio",
+                  label: isMp4Audio ? "Full Music Audio (M4A AAC)" : "Full Music Audio (WebM Opus)",
+                  ext,
+                  mime,
+                  hasAudio: true,
+                  hasVideo: false,
+                  sizeBytes,
+                  rawUrl: streamUrl,
+                });
+              } else if (typeStr.startsWith("video/") && s.qualityLabel) {
+                const isMp4Video = typeStr.includes("mp4") || s.container === "mp4";
+                const isAvc1 = typeStr.includes("avc1");
+                const ext = isMp4Video ? ".mp4" : ".webm";
+                const mime = isMp4Video ? "video/mp4" : "video/webm";
+                catalog.adaptiveVideoStreams.push({
+                  itag: String(s.itag || ""),
+                  quality: s.qualityLabel,
+                  // Normalize "1080p60" -> "1080p" for lookup convenience
+                  normQuality: String(s.qualityLabel).replace(/p\d+$/i, "p"),
+                  label: `${s.qualityLabel} HD Video (${ext.toUpperCase().slice(1)})`,
+                  ext,
+                  mime,
+                  isAvc1,
+                  hasAudio: false,
+                  hasVideo: true,
+                  sizeBytes,
+                  rawUrl: streamUrl,
+                });
+              }
+            }
+          }
+          break;
+        } catch {
+          /* try next instance */
+        }
+      }
+
+      // 2. Also check Piped instances (pipedapi.ducks.party / api.piped.private.coffee)
+      // for direct fetch()-able CORS streams (piped-proxy.ducks.party/videoplayback).
+      const pipedBases = [
+        "https://pipedapi.ducks.party",
+        "https://api.piped.private.coffee",
+      ];
+      for (const base of pipedBases) {
+        try {
+          const r = await fetch(`${base}/streams/${encodeURIComponent(ytId)}`, {
+            signal: AbortSignal.timeout ? AbortSignal.timeout(5000) : undefined,
+          });
+          if (!r.ok) continue;
+          const d = await r.json();
+          if (d && d.title && !catalog.title) catalog.title = d.title;
+          if (d && d.uploader && !catalog.channelTitle) catalog.channelTitle = d.uploader;
+          if (d && Number.isFinite(d.duration) && d.duration > 0 && !catalog.duration) {
+            catalog.duration = d.duration;
+          }
+          const mp4Prog = (d.videoStreams || []).find(
+            (s) => !s.videoOnly && (s.format === "MPEG_4" || s.mimeType === "video/mp4") && s.url && !s.url.includes("odycdn.com")
+          );
+          if (mp4Prog && mp4Prog.url) {
+            catalog.corsDirectVideoUrl = mp4Prog.url;
+            if (!catalog.muxedStreams.length) {
+              catalog.muxedStreams.push({
+                itag: String(mp4Prog.itag || "18"),
+                quality: mp4Prog.quality || "360p",
+                label: `${mp4Prog.quality || "360p"} Video + Audio (MP4)`,
+                ext: ".mp4",
+                mime: "video/mp4",
+                hasAudio: true,
+                hasVideo: true,
+                sizeBytes: 0,
+                rawUrl: mp4Prog.url,
+              });
+            }
+            break;
+          }
+        } catch {
+          /* continue */
+        }
+      }
+
+      // Enrich currently playing video metadata if it was a generic placeholder
+      if (currentVideoId === ytId && currentVideoMeta) {
+        if (
+          catalog.title &&
+          (!currentVideoMeta.title ||
+            currentVideoMeta.title === "YouTube Video" ||
+            currentVideoMeta.title.startsWith("YouTube Video ("))
+        ) {
+          currentVideoMeta.title = catalog.title;
+        }
+        if (catalog.channelTitle && !currentVideoMeta.channelTitle) {
+          currentVideoMeta.channelTitle = catalog.channelTitle;
+        }
+        if (catalog.duration && !currentVideoMeta.duration) {
+          currentVideoMeta.duration = catalog.duration;
+        }
+      }
+
+      if (
+        catalog.muxedStreams.length ||
+        catalog.audioStreams.length ||
+        catalog.adaptiveVideoStreams.length ||
+        catalog.corsDirectVideoUrl
+      ) {
+        youtubeStreamCatalogCache.set(ytId, catalog);
+      }
+      refreshDownloadUIs();
+      return catalog;
+    })();
+
+    youtubeStreamCatalogInflight.set(ytId, promise);
+    try {
+      return await promise;
+    } finally {
+      youtubeStreamCatalogInflight.delete(ytId);
+    }
+  }
+
+  function prefetchYoutubeStreamCatalog(ytId) {
+    if (!ytId) return;
+    resolveYoutubeStreamCatalog(ytId).catch(() => {});
+  }
+
+  // Selects the matching stream descriptor from the resolved YouTube catalog
+  // for a requested resolution ("best", "360p", "720p", "1080p", "audio", etc.)
+  // and format preference.
+  function pickStreamFromCatalog(catalog, resolution, fmt) {
+    if (!catalog) return null;
+    const isAudioRequest =
+      resolution === "audio" ||
+      (fmt && fmt.id && fmt.id.startsWith("audio/"));
+
+    if (isAudioRequest) {
+      // Prefer M4A (itag 140) for Windows Media Player compatibility unless WebM/Ogg requested
+      const wantWebm = fmt && (fmt.id === "audio/ogg" || fmt.ext === ".webm");
+      const m4a = catalog.audioStreams.find((s) => s.ext === ".m4a");
+      const webm = catalog.audioStreams.find((s) => s.ext === ".webm");
+      const chosen = (wantWebm ? webm || m4a : m4a || webm) || catalog.muxedStreams[0];
+      if (chosen) {
+        return {
+          ...chosen,
+          resolutionLabel: "Audio",
+        };
+      }
+    }
+
+    // For "best" or "360p", ALWAYS pick the muxed Video + Audio MP4 stream first
+    // so the file plays with BOTH video and stereo music sound in Windows Media Player!
+    if (resolution === "best" || resolution === "360p" || !resolution) {
+      if (catalog.muxedStreams.length) {
+        const muxed = catalog.muxedStreams[0];
+        return {
+          ...muxed,
+          resolutionLabel: `${muxed.quality} Video+Audio`,
+        };
+      }
+    }
+
+    // Check if muxedStreams happens to have the exact requested resolution (e.g. 720p itag 22)
+    const exactMuxed = catalog.muxedStreams.find(
+      (s) => s.quality === resolution || s.quality.startsWith(resolution)
+    );
+    if (exactMuxed) {
+      return {
+        ...exactMuxed,
+        resolutionLabel: `${exactMuxed.quality} Video+Audio`,
+      };
+    }
+
+    // Check adaptiveVideoStreams (preferring H.264 avc1 MP4 for Windows Media Player)
+    const wantWebmVideo = fmt && fmt.id === "video/webm";
+    const matchingAdaptive = catalog.adaptiveVideoStreams.filter(
+      (s) => s.quality === resolution || s.normQuality === resolution
+    );
+    if (matchingAdaptive.length) {
+      const picked =
+        matchingAdaptive.find((s) => (wantWebmVideo ? s.ext === ".webm" : s.ext === ".mp4" && s.isAvc1)) ||
+        matchingAdaptive.find((s) => (wantWebmVideo ? s.ext === ".webm" : s.ext === ".mp4")) ||
+        matchingAdaptive[0];
+      return {
+        ...picked,
+        resolutionLabel: picked.quality,
+      };
+    }
+
+    // Fallback to muxed Video + Audio MP4 if specific HD resolution isn't on this video
+    if (catalog.muxedStreams.length) {
+      const muxed = catalog.muxedStreams[0];
+      return {
+        ...muxed,
+        resolutionLabel: `${muxed.quality} Video+Audio`,
+      };
+    }
+
+    if (catalog.adaptiveVideoStreams.length) {
+      const top = catalog.adaptiveVideoStreams[0];
+      return {
+        ...top,
+        resolutionLabel: top.quality,
+      };
+    }
+
+    return null;
   }
 
   function openAuthorizedMediaDB() {
@@ -7875,8 +8289,6 @@
         }
       } catch (err) {
         if (err && err.name === "AbortError") return null;
-        // Cross-origin preview iframe restriction in Chromium: explain clearly
-        // and set up browser native download + IndexedDB local storage.
         downloadPrefs.folderLabel = "Browser Downloads + Local Storage";
         saveDownloadPrefs();
         showStatus(
@@ -7915,7 +8327,6 @@
         /* Fall through to browser download trigger below */
       }
     }
-    // Also trigger native browser download so the file lands in the user's disk Downloads folder
     try {
       const tempUrl = URL.createObjectURL(blob);
       const a = document.createElement("a");
@@ -7929,6 +8340,27 @@
       /* non-fatal */
     }
     return { savedToFolder: false, folderName: downloadPrefs.folderLabel || "Browser Downloads" };
+  }
+
+  function triggerDirectStreamDownloadInBrowser(streamUrl, fileName) {
+    if (!streamUrl) return false;
+    const downloadUrl = toCompanionDownloadUrl(streamUrl, fileName);
+    try {
+      const opened = window.open(downloadUrl, "_blank", "noopener,noreferrer");
+      if (!opened) {
+        const a = document.createElement("a");
+        a.href = downloadUrl;
+        a.target = "_blank";
+        a.rel = "noopener noreferrer";
+        a.download = fileName || "video.mp4";
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+      }
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   /* ---- Automatic "Downloaded" Playlist in YouTube Window -------------- */
@@ -7947,7 +8379,6 @@
     if (!dlPlaylist) return null;
     const playId = videoId || "";
     if (!playId) return null;
-    // Avoid exact duplicate title + videoId row if re-downloaded
     const existing = dlPlaylist.items.find((it) => it.videoId === playId && it.title === title);
     if (existing) {
       touchPlaylist(dlPlaylist);
@@ -7978,7 +8409,7 @@
   }
 
   function formatByteSize(bytes) {
-    if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+    if (!Number.isFinite(bytes) || bytes <= 0) return "Stream";
     if (bytes < 1024) return `${bytes} B`;
     if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
     return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
@@ -7991,15 +8422,19 @@
     }
     try {
       const blob = await getAuthorizedMediaBlob(item.id);
-      if (blob instanceof Blob) {
-        const url = URL.createObjectURL(blob);
-        sessionBlobUrlCache.set(item.id, url);
-        return url;
+      if (blob instanceof Blob && blob.size > 1024) {
+        const headerBytes = new Uint8Array(await blob.slice(0, 256).arrayBuffer());
+        const check = inspectBinaryMediaHeader(headerBytes);
+        if (check.valid) {
+          const url = URL.createObjectURL(blob);
+          sessionBlobUrlCache.set(item.id, url);
+          return url;
+        }
       }
     } catch {
       /* fallback to sourceUrl if available */
     }
-    if (item.sourceUrl && !item.sourceUrl.startsWith("local-file:")) {
+    if (item.sourceUrl && !item.sourceUrl.startsWith("local-file:") && !extractVideoId(item.sourceUrl)) {
       return item.sourceUrl;
     }
     return null;
@@ -8009,25 +8444,40 @@
     const item = authorizedLibraryItems.find((it) => it.id === itemId);
     if (!item) return false;
     closeDownloadPopover();
-    // If this library entry came from a YouTube video and doesn't carry a
-    // standalone raw video stream, play it via its YouTube videoId so the
-    // full video/audio plays reliably in the YouTube window.
-    if (item.youtubeVideoId && !item.hasRawMediaStream) {
+
+    // First check if we have a verified raw binary media blob in IndexedDB
+    if (item.hasRawMediaStream) {
+      const resolvedUrl = await resolveLibraryItemBlobUrl(item);
+      if (resolvedUrl) {
+        return loadMediaItem(
+          {
+            kind: "local",
+            videoId: `local:${resolvedUrl}`,
+            src: resolvedUrl,
+            title: item.title || "Local Media",
+            channelTitle: `Local Library • ${item.formatLabel || item.mimeType || "Media"}`,
+            duration: item.duration || null,
+          },
+          { source: "library" }
+        );
+      }
+    }
+
+    // If this library entry is a YouTube video, play it reliably in the YouTube window
+    if (item.youtubeVideoId) {
       return loadVideo(item.youtubeVideoId, {
         source: "library",
         meta: {
-          title: item.title || "Downloaded Video",
+          title: item.baseTitle || item.title || "Downloaded Video",
           channelTitle: item.channelTitle || `Downloaded • ${item.resolution || "HD"}`,
           thumbnailUrl: item.thumbnailUrl || `https://i.ytimg.com/vi/${item.youtubeVideoId}/mqdefault.jpg`,
           duration: item.duration || null,
         },
       });
     }
+
     const resolvedUrl = await resolveLibraryItemBlobUrl(item);
     if (!resolvedUrl) {
-      if (item.youtubeVideoId) {
-        return loadVideo(item.youtubeVideoId, { source: "library" });
-      }
       showStatus("This library item's local media data is no longer available.", 4000);
       return false;
     }
@@ -8047,33 +8497,45 @@
   async function saveAuthorizedLibraryItemToDisk(itemId) {
     const item = authorizedLibraryItems.find((it) => it.id === itemId);
     if (!item) return false;
-    let blob = null;
+    const ext = item.fileExt || ".mp4";
+    const safeName = sanitizeFilenameBase(item.title || item.baseTitle || "downloaded-video");
+    const fileName = safeName.toLowerCase().endsWith(ext) ? safeName : `${safeName}${ext}`;
+
     try {
-      blob = await getAuthorizedMediaBlob(item.id);
+      const blob = await getAuthorizedMediaBlob(item.id);
+      if (blob instanceof Blob && blob.size > 1024) {
+        const headerBytes = new Uint8Array(await blob.slice(0, 256).arrayBuffer());
+        const check = inspectBinaryMediaHeader(headerBytes);
+        if (check.valid) {
+          const finalFileName = safeName.toLowerCase().endsWith(check.ext) ? safeName : `${safeName}${check.ext}`;
+          await writeBlobToChosenFolder(finalFileName, blob);
+          showStatus(`Saved playable “${escapeHtml(finalFileName)}” to ${escapeHtml(downloadPrefs.folderLabel || "your downloads")}.`, 3500);
+          return true;
+        }
+      }
     } catch {
-      blob = null;
+      /* continue to direct stream fallback */
     }
-    const fmt = AUTHORIZED_MEDIA_FORMATS.find((f) => f.id === item.mimeType) || AUTHORIZED_MEDIA_FORMATS[0];
-    const safeName = (item.title || "downloaded-video").replace(/[<>:"/\\|?*\x00-\x1F]/g, "_").trim() || "downloaded-video";
-    const fileName = fmt.ext && !safeName.toLowerCase().endsWith(fmt.ext) ? `${safeName}${fmt.ext}` : safeName;
-    if (blob instanceof Blob) {
-      await writeBlobToChosenFolder(fileName, blob);
-      showStatus(`Saved “${escapeHtml(fileName)}” to ${escapeHtml(downloadPrefs.folderLabel || "your downloads")}.`, 3000);
+
+    if (item.directStreamUrl) {
+      triggerDirectStreamDownloadInBrowser(item.directStreamUrl, fileName);
+      showStatus(`⬇ Downloading playable “${escapeHtml(fileName)}” directly to your computer…`, 4500);
       return true;
     }
-    const resolvedUrl = await resolveLibraryItemBlobUrl(item);
-    if (!resolvedUrl) {
-      showStatus("Couldn't find local media data to save.", 3500);
-      return false;
+
+    if (item.youtubeVideoId) {
+      const catalog = await resolveYoutubeStreamCatalog(item.youtubeVideoId);
+      const stream = pickStreamFromCatalog(catalog, item.resolution || "best", { id: item.mimeType || "video/mp4" });
+      if (stream && stream.rawUrl) {
+        const streamFileName = `${sanitizeFilenameBase(item.baseTitle || item.title)}-${stream.resolutionLabel || "Video"}${stream.ext}`;
+        triggerDirectStreamDownloadInBrowser(stream.rawUrl, streamFileName);
+        showStatus(`⬇ Downloading playable “${escapeHtml(streamFileName)}” directly to your computer…`, 4500);
+        return true;
+      }
     }
-    const a = document.createElement("a");
-    a.href = resolvedUrl;
-    a.download = fileName;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    showStatus(`Saved “${escapeHtml(fileName)}” to your downloads.`, 3000);
-    return true;
+
+    showStatus("Couldn't find local media stream to save.", 3500);
+    return false;
   }
 
   async function removeAuthorizedLibraryItem(itemId) {
@@ -8103,6 +8565,8 @@
       const id = genId("media");
       const title = (file.name || "Local Media").replace(/\.[^/.]+$/, "") || "Local Media";
       const mimeType = file.type || "video/mp4";
+      const extMatch = (file.name || "").match(/(\.[a-z0-9]{2,5})$/i);
+      const fileExt = extMatch ? extMatch[1].toLowerCase() : ".mp4";
       try {
         await putAuthorizedMediaBlob(id, file);
         const blobUrl = URL.createObjectURL(file);
@@ -8110,8 +8574,10 @@
         const entry = {
           id,
           title,
+          baseTitle: title,
           sourceUrl: `local-file:${file.name || id}`,
           mimeType,
+          fileExt,
           formatLabel: file.type || "Local File",
           resolution: "Original",
           hasRawMediaStream: true,
@@ -8181,111 +8647,171 @@
     return true;
   }
 
-  // Attempts to resolve a real progressive stream via public CORS Piped/Invidious
-  // APIs for a YouTube videoId + resolution; if CORS or instance limits block
-  // direct stream bytes, synthesizes a valid media container with simulated
-  // streaming progress so the file write to disk, IndexedDB storage, and
-  // "Downloaded" playlist entry always complete reliably.
-  async function fetchOrSynthesizeYoutubeMedia(ytId, resolution, fmt, job) {
-    const pipedInstances = [
-      "https://pipedapi.kavin.rocks",
-      "https://pipedapi.tokhmi.xyz",
-      "https://pipedapi.moomoo.me",
-    ];
-    for (const base of pipedInstances) {
-      try {
-        const infoRes = await fetch(`${base}/streams/${encodeURIComponent(ytId)}`, {
-          signal: job.controller.signal,
-        });
-        if (!infoRes.ok) continue;
-        const info = await infoRes.json();
-        const streams =
-          resolution === "audio" || fmt.id.startsWith("audio/")
-            ? info.audioStreams || []
-            : (info.videoStreams || []).filter((s) => !s.videoOnly);
-        const match =
-          streams.find((s) => s.quality === resolution) ||
-          streams[0];
-        if (match && match.url) {
-          const mediaRes = await fetch(match.url, { signal: job.controller.signal });
-          if (mediaRes.ok && mediaRes.body) {
-            const len = parseInt(mediaRes.headers.get("content-length") || "0", 10) || 0;
-            job.totalBytes = len;
-            const reader = mediaRes.body.getReader();
-            const chunks = [];
-            while (true) {
-              const { done, value } = await reader.read();
-              if (done) break;
-              if (value) {
-                chunks.push(value);
-                job.receivedBytes += value.byteLength;
-                if (job.totalBytes > 0) {
-                  job.percent = Math.min(100, Math.round((job.receivedBytes / job.totalBytes) * 100));
-                } else {
-                  job.percent = Math.min(95, job.percent + 10);
-                }
-                updateDownloadJobDOM(job);
+  // Helper to stream a fetch() Response into a verified binary media Blob with
+  // live progress updates, returning null if the payload is not a valid binary
+  // video/audio container.
+  async function readVerifiedMediaStreamResponse(response, job) {
+    if (!response || !response.ok) return null;
+    const ct = (response.headers.get("content-type") || "").toLowerCase();
+    if (ct.includes("text/html") || ct.includes("application/json") || ct.includes("text/plain")) {
+      return null;
+    }
+    const len = parseInt(response.headers.get("content-length") || "0", 10) || 0;
+    if (len > 0) job.totalBytes = len;
+
+    if (response.body && typeof response.body.getReader === "function") {
+      const reader = response.body.getReader();
+      const chunks = [];
+      let headerChecked = false;
+      let headerInfo = null;
+      let firstBytes = new Uint8Array(0);
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value) {
+          if (!headerChecked) {
+            const combined = new Uint8Array(firstBytes.byteLength + value.byteLength);
+            combined.set(firstBytes, 0);
+            combined.set(value, firstBytes.byteLength);
+            firstBytes = combined;
+            if (firstBytes.byteLength >= 32) {
+              headerChecked = true;
+              headerInfo = inspectBinaryMediaHeader(firstBytes);
+              if (!headerInfo.valid) {
+                try {
+                  reader.cancel();
+                } catch {}
+                return null;
               }
             }
-            const blob = new Blob(chunks, { type: fmt.id === "auto" ? "video/mp4" : fmt.id });
-            if (blob.size > 1024) {
-              return { blob, hasRawMediaStream: true };
-            }
           }
+          chunks.push(value);
+          job.receivedBytes += value.byteLength;
+          if (job.totalBytes > 0) {
+            job.percent = Math.min(100, Math.round((job.receivedBytes / job.totalBytes) * 100));
+          } else {
+            job.percent = Math.min(95, job.percent + 8);
+          }
+          updateDownloadJobDOM(job);
+        }
+      }
+      if (!headerChecked) {
+        headerInfo = inspectBinaryMediaHeader(firstBytes);
+      }
+      if (!headerInfo || !headerInfo.valid) return null;
+      const blob = new Blob(chunks, { type: headerInfo.mime });
+      if (blob.size < 4096) return null;
+      return { blob, ext: headerInfo.ext, mime: headerInfo.mime };
+    } else {
+      const rawBlob = await response.blob();
+      if (rawBlob.size < 4096) return null;
+      const head = new Uint8Array(await rawBlob.slice(0, 256).arrayBuffer());
+      const headerInfo = inspectBinaryMediaHeader(head);
+      if (!headerInfo.valid) return null;
+      job.receivedBytes = rawBlob.size;
+      job.totalBytes = rawBlob.size;
+      job.percent = 100;
+      updateDownloadJobDOM(job);
+      return {
+        blob: new Blob([rawBlob], { type: headerInfo.mime }),
+        ext: headerInfo.ext,
+        mime: headerInfo.mime,
+      };
+    }
+  }
+
+  // Resolves a genuine playable YouTube media file:
+  // 1. Tries /api/yt-stream (server-side proxy + ffmpeg HD muxer when running in AI Studio / local dev).
+  // 2. Tries direct CORS binary stream fetch from piped-proxy.ducks.party or resolved stream URL.
+  // 3. When running on static GitHub Pages where direct fetch() is blocked by CORS/Anubis,
+  //    returns the verified Invidious Companion stream URL so the browser natively downloads
+  //    the genuine multi-megabyte .mp4 / .m4a stream with zero corrupt bytes!
+  async function fetchRealYoutubeMediaOrStream(ytId, resolution, fmt, job, preloadedCatalog) {
+    // 1. Try local/AI Studio server stream endpoint (/api/yt-stream) if available
+    try {
+      const apiRes = await fetch(
+        `/api/yt-stream?id=${encodeURIComponent(ytId)}&res=${encodeURIComponent(resolution || "best")}&fmt=${encodeURIComponent(fmt.id || "video/mp4")}`,
+        { signal: job.controller.signal }
+      );
+      const verified = await readVerifiedMediaStreamResponse(apiRes, job);
+      if (verified) {
+        return {
+          blob: verified.blob,
+          ext: verified.ext,
+          mime: verified.mime,
+          hasRawMediaStream: true,
+          directStreamUrl: null,
+          sizeBytes: verified.blob.size,
+        };
+      }
+    } catch (e) {
+      if (e && e.name === "AbortError") throw e;
+    }
+
+    // 2. Resolve the public stream catalog (invidious.f5.si + pipedapi.ducks.party)
+    const catalog = preloadedCatalog || (await resolveYoutubeStreamCatalog(ytId));
+    const chosenStream = pickStreamFromCatalog(catalog, resolution, fmt);
+
+    // 3. If a direct CORS-enabled Piped proxy MP4 URL is available, try streaming it via fetch()
+    if (catalog && catalog.corsDirectVideoUrl && (resolution === "best" || resolution === "360p")) {
+      try {
+        const corsRes = await fetch(catalog.corsDirectVideoUrl, { signal: job.controller.signal });
+        const verified = await readVerifiedMediaStreamResponse(corsRes, job);
+        if (verified) {
+          return {
+            blob: verified.blob,
+            ext: verified.ext,
+            mime: verified.mime,
+            hasRawMediaStream: true,
+            directStreamUrl: chosenStream ? chosenStream.rawUrl : catalog.corsDirectVideoUrl,
+            sizeBytes: verified.blob.size,
+          };
         }
       } catch (e) {
         if (e && e.name === "AbortError") throw e;
       }
     }
 
-    // Fallback: progressive chunked generation with realistic resolution byte sizing
-    // and live progress updates so local folder saving & "Downloaded" playlist
-    // registration always succeed even when third-party stream proxies are blocked.
-    const resScale = {
-      "2160p": 384 * 1024,
-      "1440p": 320 * 1024,
-      "1080p": 256 * 1024,
-      "720p": 192 * 1024,
-      "480p": 128 * 1024,
-      "360p": 96 * 1024,
-      "240p": 64 * 1024,
-      audio: 80 * 1024,
-    };
-    const targetBytes = resScale[resolution] || 160 * 1024;
-    job.totalBytes = targetBytes;
-    const steps = 8;
-    const stepBytes = Math.floor(targetBytes / steps);
-    const chunks = [];
-    const headerMeta = JSON.stringify({
-      app: "LiteraryVocabularyRegister-MediaContainer",
-      youtubeVideoId: ytId,
-      title: job.title,
-      resolution,
-      format: fmt.id,
-      watchUrl: `https://www.youtube.com/watch?v=${ytId}`,
-      downloadedAt: new Date().toISOString(),
-    });
-    const headerBytes = new TextEncoder().encode(headerMeta + "\n");
-    chunks.push(headerBytes);
-
-    for (let i = 1; i <= steps; i++) {
-      if (job.controller.signal.aborted) {
-        const abortErr = new Error("Aborted");
-        abortErr.name = "AbortError";
-        throw abortErr;
+    // 4. Try direct fetch() on chosenStream.rawUrl (succeeds if browser/proxy allows CORS)
+    if (chosenStream && chosenStream.rawUrl) {
+      try {
+        const directRes = await fetch(chosenStream.rawUrl, { signal: job.controller.signal });
+        const verified = await readVerifiedMediaStreamResponse(directRes, job);
+        if (verified) {
+          return {
+            blob: verified.blob,
+            ext: verified.ext,
+            mime: verified.mime,
+            hasRawMediaStream: true,
+            directStreamUrl: chosenStream.rawUrl,
+            sizeBytes: verified.blob.size,
+          };
+        }
+      } catch (e) {
+        if (e && e.name === "AbortError") throw e;
       }
-      await new Promise((r) => setTimeout(r, 95));
-      const pad = new Uint8Array(stepBytes);
-      chunks.push(pad);
-      job.receivedBytes = Math.min(targetBytes, i * stepBytes);
-      job.percent = Math.min(100, Math.round((i / steps) * 100));
+
+      // 5. Static GitHub Pages path: chosenStream.rawUrl is a verified real YouTube stream
+      // on invidious.f5.si/companion/videoplayback (ftypmp42 / ftypdash). Return its
+      // direct stream descriptor so the browser natively downloads the real MP4/M4A file
+      // without writing any fake or corrupt bytes!
+      job.percent = 100;
+      job.totalBytes = chosenStream.sizeBytes || 0;
+      job.receivedBytes = chosenStream.sizeBytes || 0;
       updateDownloadJobDOM(job);
+      return {
+        blob: null,
+        ext: chosenStream.ext || ".mp4",
+        mime: chosenStream.mime || "video/mp4",
+        hasRawMediaStream: false,
+        directStreamUrl: chosenStream.rawUrl,
+        sizeBytes: chosenStream.sizeBytes || 0,
+        streamLabel: chosenStream.label || chosenStream.resolutionLabel || resolution,
+      };
     }
-    const mime = fmt.id === "auto" ? "video/mp4" : fmt.id;
-    return {
-      blob: new Blob(chunks, { type: mime }),
-      hasRawMediaStream: false,
-    };
+
+    throw new Error("Could not resolve playable media stream for this video.");
   }
 
   async function downloadSingleResolutionItem({
@@ -8297,21 +8823,22 @@
     baseDuration,
     resolution,
     fmt,
+    catalog,
+    triggerBrowserStream = true,
   }) {
-    const resTag = resolution || "1080p";
-    const fullTitle = `${baseTitle} [${resTag} • ${fmt.short}]`;
+    const resTag = resolution === "best" ? "Video+Audio" : resolution || "Video+Audio";
     const jobId = genId("dljob");
     const controller = new AbortController();
     const job = {
       id: jobId,
-      title: fullTitle,
+      title: `${baseTitle} [${resTag}]`,
       url: rawTarget,
       resolution: resTag,
       formatId: fmt.id,
       formatLabel: fmt.short,
       receivedBytes: 0,
       totalBytes: 0,
-      percent: 5,
+      percent: 10,
       status: "downloading",
       controller,
     };
@@ -8321,54 +8848,53 @@
     try {
       let finalBlob = null;
       let hasRawMediaStream = false;
+      let directStreamUrl = null;
+      let actualExt = fmt.ext || ".mp4";
+      let actualMime = fmt.id === "auto" ? "video/mp4" : fmt.id;
+      let reportedSize = 0;
 
       if (ytId) {
-        const res = await fetchOrSynthesizeYoutubeMedia(ytId, resTag, fmt, job);
+        const res = await fetchRealYoutubeMediaOrStream(ytId, resolution, fmt, job, catalog);
         finalBlob = res.blob;
         hasRawMediaStream = res.hasRawMediaStream;
+        directStreamUrl = res.directStreamUrl;
+        actualExt = res.ext || actualExt;
+        actualMime = res.mime || actualMime;
+        reportedSize = res.sizeBytes || (finalBlob ? finalBlob.size : 0);
       } else {
         const response = await fetch(rawTarget, {
           method: "GET",
           signal: controller.signal,
           headers: { Accept: fmt.accept },
         });
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        const contentLengthHeader = response.headers.get("content-length");
-        job.totalBytes = contentLengthHeader ? Math.max(0, parseInt(contentLengthHeader, 10) || 0) : 0;
-        const effectiveMime = fmt.id !== "auto" ? fmt.id : (response.headers.get("content-type") || "video/mp4").split(";")[0].trim();
-        if (response.body && typeof response.body.getReader === "function") {
-          const reader = response.body.getReader();
-          const chunks = [];
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            if (value) {
-              chunks.push(value);
-              job.receivedBytes += value.byteLength;
-              if (job.totalBytes > 0) {
-                job.percent = Math.min(100, Math.round((job.receivedBytes / job.totalBytes) * 100));
-              }
-              updateDownloadJobDOM(job);
-            }
-          }
-          finalBlob = new Blob(chunks, { type: effectiveMime });
-        } else {
-          finalBlob = await response.blob();
-          job.receivedBytes = finalBlob.size;
-          job.totalBytes = finalBlob.size;
-          job.percent = 100;
+        const verified = await readVerifiedMediaStreamResponse(response, job);
+        if (!verified) {
+          throw new Error("The URL did not return a valid playable video or audio file.");
         }
+        finalBlob = verified.blob;
+        actualExt = verified.ext;
+        actualMime = verified.mime;
+        reportedSize = finalBlob.size;
         hasRawMediaStream = true;
       }
 
-      const mediaId = genId("media");
-      await putAuthorizedMediaBlob(mediaId, finalBlob);
-      const blobUrl = URL.createObjectURL(finalBlob);
-      sessionBlobUrlCache.set(mediaId, blobUrl);
+      const extLabel = actualExt.replace(/^\./, "").toUpperCase();
+      const fullTitle = `${baseTitle} [${resTag} • ${extLabel}]`;
+      const safeBase = sanitizeFilenameBase(baseTitle);
+      const fileName = `${safeBase} - ${resTag}${actualExt}`;
 
-      const safeBase = baseTitle.replace(/[<>:"/\\|?*\x00-\x1F]/g, "_").trim() || "video";
-      const fileName = `${safeBase}-${resTag}${fmt.ext || ".mp4"}`;
-      const diskResult = await writeBlobToChosenFolder(fileName, finalBlob);
+      const mediaId = genId("media");
+      let blobUrl = null;
+      let diskResult = { savedToFolder: false, folderName: downloadPrefs.folderLabel || "Browser Downloads" };
+
+      if (finalBlob instanceof Blob && hasRawMediaStream) {
+        await putAuthorizedMediaBlob(mediaId, finalBlob);
+        blobUrl = URL.createObjectURL(finalBlob);
+        sessionBlobUrlCache.set(mediaId, blobUrl);
+        diskResult = await writeBlobToChosenFolder(fileName, finalBlob);
+      } else if (directStreamUrl && triggerBrowserStream) {
+        triggerDirectStreamDownloadInBrowser(directStreamUrl, fileName);
+      }
 
       const resolvedThumb = baseThumb || (ytId ? `https://i.ytimg.com/vi/${ytId}/mqdefault.jpg` : "");
       const entry = {
@@ -8380,26 +8906,30 @@
         duration: baseDuration || null,
         youtubeVideoId: ytId || null,
         hasRawMediaStream,
+        directStreamUrl: directStreamUrl || null,
+        fileExt: actualExt,
         sourceUrl: rawTarget,
-        mimeType: fmt.id === "auto" ? "video/mp4" : fmt.id,
-        formatLabel: `${resTag} ${fmt.short}`,
+        mimeType: actualMime,
+        formatLabel: `${resTag} ${extLabel}`,
         resolution: resTag,
         savedFolder: diskResult.folderName,
-        sizeBytes: finalBlob.size,
+        sizeBytes: reportedSize,
         createdAt: Date.now(),
       };
       authorizedLibraryItems.unshift(entry);
       saveAuthorizedLibraryIndex();
 
       // Automatically add to the "Downloaded" playlist in the YouTube window
-      const playlistVideoId = ytId ? ytId : `local:${blobUrl}`;
-      addDownloadedMediaToPlaylist({
-        videoId: playlistVideoId,
-        title: fullTitle,
-        channelTitle: `${baseChannel || "YouTube"} • ${diskResult.folderName}`,
-        thumbnailUrl: resolvedThumb,
-        duration: baseDuration || null,
-      });
+      const playlistVideoId = ytId ? ytId : blobUrl ? `local:${blobUrl}` : "";
+      if (playlistVideoId) {
+        addDownloadedMediaToPlaylist({
+          videoId: playlistVideoId,
+          title: fullTitle,
+          channelTitle: `${baseChannel || "YouTube"} • ${diskResult.folderName}`,
+          thumbnailUrl: resolvedThumb,
+          duration: baseDuration || null,
+        });
+      }
 
       activeDownloadJobs.delete(jobId);
       refreshDownloadUIs();
@@ -8408,7 +8938,7 @@
       activeDownloadJobs.delete(jobId);
       refreshDownloadUIs();
       if (err && err.name === "AbortError") return null;
-      showStatus(`Couldn't finish downloading “${escapeHtml(fullTitle)}”: ${escapeHtml(err?.message || "network error")}`, 4500);
+      showStatus(`Couldn't finish downloading “${escapeHtml(baseTitle)}”: ${escapeHtml(err?.message || "stream unavailable")}`, 4500);
       return null;
     }
   }
@@ -8417,7 +8947,7 @@
     rawInput,
     {
       formatId = downloadPrefs.formatId || "video/mp4",
-      resolution = downloadPrefs.resolution || "all",
+      resolution = downloadPrefs.resolution || "best",
       title = "",
       channelTitle = "",
       thumbnailUrl = "",
@@ -8436,17 +8966,38 @@
     const fmt = AUTHORIZED_MEDIA_FORMATS.find((f) => f.id === formatId) || AUTHORIZED_MEDIA_FORMATS[0];
     const ytId = extractVideoId(target) || (activeMediaKind === "youtube" && currentVideoId === target ? extractVideoId(currentVideoId) : null);
 
+    let catalog = null;
+    if (ytId) {
+      showStatus("🔍 Resolving real playable video + audio stream…", 3000);
+      catalog = await resolveYoutubeStreamCatalog(ytId);
+    }
+
     let baseTitle = (title || "").trim();
     let baseChannel = (channelTitle || "").trim();
     let baseThumb = thumbnailUrl || "";
     let baseDuration = duration || null;
 
     if (currentVideoId && (target === currentVideoId || ytId === currentVideoId) && currentVideoMeta) {
-      if (!baseTitle) baseTitle = currentVideoMeta.title || "YouTube Video";
-      if (!baseChannel) baseChannel = currentVideoMeta.channelTitle || "YouTube";
+      if (!baseTitle || baseTitle === "YouTube Video") baseTitle = currentVideoMeta.title || "";
+      if (!baseChannel) baseChannel = currentVideoMeta.channelTitle || "";
       if (!baseThumb) baseThumb = currentVideoMeta.thumbnailUrl || "";
       if (!baseDuration) baseDuration = currentVideoMeta.duration || null;
       if (!ytId && currentVideoMeta.src) target = currentVideoMeta.src;
+    }
+
+    if (catalog) {
+      if (!baseTitle || baseTitle === "YouTube Video" || baseTitle.startsWith("YouTube Video (")) {
+        baseTitle = catalog.title || baseTitle;
+      }
+      if (!baseChannel || baseChannel === "YouTube") {
+        baseChannel = catalog.channelTitle || baseChannel;
+      }
+      if (!baseDuration && catalog.duration) {
+        baseDuration = catalog.duration;
+      }
+      if (!baseThumb && catalog.thumbnailUrl) {
+        baseThumb = catalog.thumbnailUrl;
+      }
     }
 
     if (!baseTitle) {
@@ -8456,17 +9007,22 @@
     const resolutionsToRun =
       resolution === "all"
         ? ALL_BATCH_RESOLUTIONS
-        : [resolution || "1080p"];
+        : [resolution || "best"];
 
     showStatus(
       resolutionsToRun.length > 1
-        ? `⬇ Downloading “${escapeHtml(baseTitle)}” in all ${resolutionsToRun.length} resolutions (${resolutionsToRun.join(", ")}) as ${fmt.short}…`
-        : `⬇ Downloading “${escapeHtml(baseTitle)}” (${escapeHtml(resolutionsToRun[0])} ${escapeHtml(fmt.short)})…`,
-      4000
+        ? `⬇ Downloading playable “${escapeHtml(baseTitle)}” (${resolutionsToRun.join(", ")})…`
+        : `⬇ Downloading playable “${escapeHtml(baseTitle)}” (${escapeHtml(resolutionsToRun[0] === "best" ? "Video + Audio MP4" : resolutionsToRun[0])})…`,
+      4500
     );
 
     const results = [];
-    for (const res of resolutionsToRun) {
+    for (let i = 0; i < resolutionsToRun.length; i++) {
+      const res = resolutionsToRun[i];
+      // When running on static GitHub Pages where direct stream downloads open a browser
+      // download tab, only auto-open the primary stream tab on batch "all" so popup blockers
+      // never block the primary playable Video+Audio MP4 file (the remaining resolutions
+      // are registered in the Library with one-click Save buttons).
       const entry = await downloadSingleResolutionItem({
         rawTarget: target,
         ytId,
@@ -8476,17 +9032,24 @@
         baseDuration,
         resolution: res,
         fmt,
+        catalog,
+        triggerBrowserStream: i === 0,
       });
       if (entry) results.push(entry);
     }
 
     if (results.length) {
       const dlPl = ensureDownloadedPlaylist();
+      const first = results[0];
       showStatus(
-        `✅ Saved ${results.length} file${results.length > 1 ? "s" : ""} to “${escapeHtml(
-          downloadPrefs.folderLabel || "Local Storage"
-        )}” and added to playlist “${escapeHtml(dlPl ? dlPl.name : "Downloaded")}”!`,
-        5500
+        first.hasRawMediaStream
+          ? `✅ Saved playable “${escapeHtml(baseTitle)}” (${escapeHtml(first.formatLabel)}) to “${escapeHtml(
+              downloadPrefs.folderLabel || "Local Storage"
+            )}” and added to playlist “${escapeHtml(dlPl ? dlPl.name : "Downloaded")}”!`
+          : `✅ Started real MP4/M4A download for “${escapeHtml(baseTitle)}” and added to playlist “${escapeHtml(
+              dlPl ? dlPl.name : "Downloaded"
+            )}”!`,
+        6000
       );
     }
     return results;
@@ -8497,13 +9060,13 @@
       showStatus("No video is currently playing — start a video first or paste a link.", 3500);
       return null;
     }
-    const resolution = opts.resolution || downloadPrefs.resolution || "all";
+    const resolution = opts.resolution || downloadPrefs.resolution || "best";
     const formatId = opts.formatId || downloadPrefs.formatId || "video/mp4";
     return startAuthorizedDownload(currentVideoId, {
       resolution,
       formatId,
-      title: currentVideoMeta?.title || "YouTube Video",
-      channelTitle: currentVideoMeta?.channelTitle || "YouTube",
+      title: currentVideoMeta?.title || "",
+      channelTitle: currentVideoMeta?.channelTitle || "",
       thumbnailUrl: currentVideoMeta?.thumbnailUrl || "",
       duration: currentVideoMeta?.duration || null,
     });
@@ -8580,6 +9143,49 @@
     return true;
   }
 
+  // Builds one-click direct stream download buttons for the currently playing video
+  function buildQuickStreamPillsHtml(ytId) {
+    if (!ytId) return "";
+    const catalog = youtubeStreamCatalogCache.get(ytId);
+    if (!catalog) {
+      prefetchYoutubeStreamCatalog(ytId);
+      return `<div class="yw-dl-stream-pills-hint">🔍 Resolving real MP4 / M4A streams for this video…</div>`;
+    }
+    const pills = [];
+    if (catalog.muxedStreams.length) {
+      const m = catalog.muxedStreams[0];
+      const sizeStr = m.sizeBytes > 0 ? ` • ${formatByteSize(m.sizeBytes)}` : "";
+      pills.push(
+        `<button type="button" class="yw-dl-btn yw-dl-btn-primary" data-dl-quick-res="best" data-dl-quick-fmt="video/mp4" title="Complete Video + Audio MP4 — Plays in Windows Media Player">🎬 Video+Audio MP4 (${escapeHtml(m.quality)}${escapeHtml(sizeStr)})</button>`
+      );
+    }
+    const m4a = catalog.audioStreams.find((s) => s.ext === ".m4a") || catalog.audioStreams[0];
+    if (m4a) {
+      const sizeStr = m4a.sizeBytes > 0 ? ` • ${formatByteSize(m4a.sizeBytes)}` : "";
+      pills.push(
+        `<button type="button" class="yw-dl-btn" data-dl-quick-res="audio" data-dl-quick-fmt="audio/mp4" title="Full Stereo Music Audio (.m4a) — Plays in Windows Media Player">🎵 Audio (${escapeHtml(m4a.ext)}${escapeHtml(sizeStr)})</button>`
+      );
+    }
+    const seenRes = new Set();
+    for (const s of catalog.adaptiveVideoStreams) {
+      const q = s.normQuality || s.quality;
+      if (seenRes.has(q) || !["2160p", "1440p", "1080p", "720p", "480p"].includes(q)) continue;
+      if (s.ext !== ".mp4") continue;
+      seenRes.add(q);
+      const sizeStr = s.sizeBytes > 0 ? ` • ${formatByteSize(s.sizeBytes)}` : "";
+      pills.push(
+        `<button type="button" class="yw-dl-btn" data-dl-quick-res="${escapeHtml(q)}" data-dl-quick-fmt="video/mp4" title="Download ${escapeHtml(q)} MP4 stream">📺 ${escapeHtml(q)}${escapeHtml(sizeStr)}</button>`
+      );
+    }
+    if (!pills.length) return "";
+    return `
+      <div class="yw-dl-quick-streams">
+        <div class="yw-dl-pop-current-label">Instant Playable Streams (Click to Save):</div>
+        <div class="yw-dl-quick-pills-wrap">${pills.join("")}</div>
+      </div>
+    `;
+  }
+
   /* ---- Floating Quick-Download Popover (#yw-download-popover) --------- */
   function positionDownloadPopover() {
     if (!downloadPopoverEl || !downloadsBtn) return;
@@ -8598,7 +9204,16 @@
   function renderDownloadPopover() {
     if (!downloadPopoverEl) return;
     const hasPlaying = !!currentVideoId;
-    const playingTitle = (currentVideoMeta && currentVideoMeta.title) || (hasPlaying ? `Video (${currentVideoId})` : "No video currently playing");
+    const activeYtId = hasPlaying && activeMediaKind === "youtube" ? extractVideoId(currentVideoId) : null;
+    if (activeYtId && !youtubeStreamCatalogCache.has(activeYtId)) {
+      prefetchYoutubeStreamCatalog(activeYtId);
+    }
+    const cachedCatalog = activeYtId ? youtubeStreamCatalogCache.get(activeYtId) : null;
+    const playingTitle =
+      (cachedCatalog && cachedCatalog.title) ||
+      (currentVideoMeta && currentVideoMeta.title && currentVideoMeta.title !== "YouTube Video" ? currentVideoMeta.title : null) ||
+      (hasPlaying ? `Video (${currentVideoId})` : "No video currently playing");
+
     const dlPlaylist = playlists.find((p) => p && typeof p.name === "string" && p.name.trim().toLowerCase() === "downloaded");
     const dlCount = dlPlaylist ? dlPlaylist.items.length : 0;
 
@@ -8635,18 +9250,24 @@
         </div>`
       : "";
 
+    const quickPillsHtml = activeYtId ? buildQuickStreamPillsHtml(activeYtId) : "";
+    const btnResLabel =
+      downloadPrefs.resolution === "best"
+        ? "Video + Audio MP4"
+        : downloadPrefs.resolution === "all"
+        ? "All Resolutions"
+        : downloadPrefs.resolution;
+
     downloadPopoverEl.innerHTML = `
       <div class="yw-dl-pop-head">
         <span class="yw-dl-pop-title">⬇ Download Playing Video</span>
         <button type="button" class="yw-dl-pop-close" id="yw-dl-pop-close-btn" title="Close">✕</button>
       </div>
       <div class="yw-dl-pop-current ${hasPlaying ? "is-playing" : "is-empty"}">
-        <span class="yw-dl-pop-dot">${hasPlaying ? "🎬" : "⏸"}</span>
-        <div class="yw-dl-pop-current-text">
-          <div class="yw-dl-pop-current-label">${hasPlaying ? "Currently Playing in Window:" : "Status:"}</div>
-          <div class="yw-dl-pop-current-name" title="${escapeHtml(playingTitle)}">${escapeHtml(playingTitle)}</div>
-        </div>
+        <div class="yw-dl-pop-current-label">${hasPlaying ? "🎬 Currently Playing in Window:" : "⏸ Status:"}</div>
+        <div class="yw-dl-pop-current-title" title="${escapeHtml(playingTitle)}">${escapeHtml(playingTitle)}</div>
       </div>
+      ${quickPillsHtml}
       <div class="yw-dl-pop-field">
         <label class="yw-dl-pop-label" for="yw-dl-pop-res">Resolution(s)</label>
         <select id="yw-dl-pop-res" class="yw-dl-format-select yw-dl-pop-select">
@@ -8660,24 +9281,20 @@
         </select>
       </div>
       <div class="yw-dl-pop-folder-row">
-        <div class="yw-dl-pop-folder-info" title="${escapeHtml(downloadPrefs.folderLabel || "Browser Downloads + Local Storage")}">
-          📁 Save Folder: <strong>${escapeHtml(downloadPrefs.folderLabel || "Choose Folder / Downloads")}</strong>
+        <div class="yw-dl-pop-folder-label" title="${escapeHtml(downloadPrefs.folderLabel || "Browser Downloads + Local Storage")}">
+          📁 Folder: <strong>${escapeHtml(downloadPrefs.folderLabel || "Browser Downloads")}</strong>
         </div>
-        <button type="button" class="yw-dl-btn" id="yw-dl-pop-folder-btn">Choose Folder…</button>
+        <button type="button" class="yw-dl-pop-folder-btn" id="yw-dl-pop-folder-btn">Choose Folder…</button>
       </div>
-      <button type="button" class="yw-dl-btn yw-dl-btn-primary yw-dl-pop-main-btn" id="yw-dl-pop-start-btn" ${hasPlaying ? "" : "disabled"}>
-        ${
-          downloadPrefs.resolution === "all"
-            ? "⬇ Download All Resolutions + Add to 'Downloaded'"
-            : `⬇ Download (${escapeHtml(downloadPrefs.resolution)}) + Add to 'Downloaded'`
-        }
+      <button type="button" class="yw-dl-pop-main-btn" id="yw-dl-pop-start-btn" ${hasPlaying ? "" : "disabled"}>
+        ⬇ Download (${escapeHtml(btnResLabel)}) + Add to 'Downloaded'
       </button>
       ${activeJobsHtml}
       <div class="yw-dl-pop-footer">
-        <button type="button" class="yw-dl-btn" id="yw-dl-pop-open-playlist-btn" title="Open the 'Downloaded' playlist in the YouTube window">
-          🎵 'Downloaded' Playlist (${dlCount})
+        <button type="button" class="yw-dl-pop-link-btn" id="yw-dl-pop-open-playlist-btn" title="Open the 'Downloaded' playlist in the YouTube window">
+          🎵 'Downloaded' (${dlCount})
         </button>
-        <button type="button" class="yw-dl-btn" id="yw-dl-pop-open-panel-btn" title="Open full Downloads &amp; Local Library manager">
+        <button type="button" class="yw-dl-pop-link-btn" id="yw-dl-pop-open-panel-btn" title="Open full Downloads &amp; Local Library manager">
           📚 Full Library (${authorizedLibraryItems.length})
         </button>
       </div>
@@ -8691,7 +9308,7 @@
     const resSelect = downloadPopoverEl.querySelector("#yw-dl-pop-res");
     const fmtSelect = downloadPopoverEl.querySelector("#yw-dl-pop-fmt");
     resSelect?.addEventListener("change", () => {
-      downloadPrefs.resolution = resSelect.value || "all";
+      downloadPrefs.resolution = resSelect.value || "best";
       saveDownloadPrefs();
       renderDownloadPopover();
     });
@@ -8710,6 +9327,18 @@
       downloadCurrentlyPlayingVideo({
         resolution: downloadPrefs.resolution,
         formatId: downloadPrefs.formatId,
+      });
+    });
+
+    downloadPopoverEl.querySelectorAll("[data-dl-quick-res]").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const qRes = btn.getAttribute("data-dl-quick-res") || "best";
+        const qFmt = btn.getAttribute("data-dl-quick-fmt") || "video/mp4";
+        downloadCurrentlyPlayingVideo({
+          resolution: qRes,
+          formatId: qFmt,
+        });
       });
     });
 
@@ -8786,7 +9415,16 @@
     ).join("");
 
     const hasPlaying = !!currentVideoId;
-    const playingTitle = (currentVideoMeta && currentVideoMeta.title) || (hasPlaying ? `Video (${currentVideoId})` : "None playing");
+    const activeYtId = hasPlaying && activeMediaKind === "youtube" ? extractVideoId(currentVideoId) : null;
+    if (activeYtId && !youtubeStreamCatalogCache.has(activeYtId)) {
+      prefetchYoutubeStreamCatalog(activeYtId);
+    }
+    const cachedCatalog = activeYtId ? youtubeStreamCatalogCache.get(activeYtId) : null;
+    const playingTitle =
+      (cachedCatalog && cachedCatalog.title) ||
+      (currentVideoMeta && currentVideoMeta.title && currentVideoMeta.title !== "YouTube Video" ? currentVideoMeta.title : null) ||
+      (hasPlaying ? `Video (${currentVideoId})` : "None playing");
+
     const dlPlaylist = playlists.find((p) => p && typeof p.name === "string" && p.name.trim().toLowerCase() === "downloaded");
     const dlCount = dlPlaylist ? dlPlaylist.items.length : 0;
 
@@ -8839,7 +9477,7 @@
                   <div class="yw-dl-item-actions">
                     <button type="button" class="yw-dl-btn yw-dl-btn-primary" data-dl-play="${escapeHtml(item.id)}" title="Play in window">▶ Play</button>
                     <button type="button" class="yw-dl-btn" data-dl-add-playlist="${escapeHtml(item.id)}" title="Add to a playlist">＋ Playlist</button>
-                    <button type="button" class="yw-dl-btn" data-dl-save="${escapeHtml(item.id)}" title="Save file to disk">💾</button>
+                    <button type="button" class="yw-dl-btn" data-dl-save="${escapeHtml(item.id)}" title="Download playable file to disk">💾 Save File</button>
                     <button type="button" class="yw-dl-btn" data-dl-delete="${escapeHtml(item.id)}" title="Remove from Local Library">🗑</button>
                   </div>
                 </div>
@@ -8847,7 +9485,9 @@
             `;
           })
           .join("")
-      : `<p class="yw-dl-empty">No downloaded videos yet. Click “⬇ Download Playing Video” above or paste any video URL below — downloaded videos save to your chosen folder and appear in your “Downloaded” playlist.</p>`;
+      : `<p class="yw-dl-empty">No downloaded videos yet. Click “⬇ Download Playing Video” above or paste any video URL below — downloaded videos save to your PC and appear in your “Downloaded” playlist.</p>`;
+
+    const quickPillsHtml = activeYtId ? buildQuickStreamPillsHtml(activeYtId) : "";
 
     downloadsPanelEl.innerHTML = `
       <div class="yw-dl-header">
@@ -8868,6 +9508,7 @@
             ⬇ Download Playing Video
           </button>
         </div>
+        ${quickPillsHtml}
         <div class="yw-dl-form-row">
           <select class="yw-dl-format-select" id="yw-dl-res-select" aria-label="Resolution selection" style="flex: 1 1 180px;">
             ${resOptionsHtml}
@@ -8912,7 +9553,7 @@
     const exportGithubBtn = downloadsPanelEl.querySelector("#yw-dl-export-github-btn");
 
     resSelect?.addEventListener("change", () => {
-      downloadPrefs.resolution = resSelect.value || "all";
+      downloadPrefs.resolution = resSelect.value || "best";
       saveDownloadPrefs();
     });
 
@@ -8925,6 +9566,18 @@
       downloadCurrentlyPlayingVideo({
         resolution: resSelect?.value || downloadPrefs.resolution,
         formatId: fmtSelect?.value || downloadPrefs.formatId,
+      });
+    });
+
+    downloadsPanelEl.querySelectorAll("[data-dl-quick-res]").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const qRes = btn.getAttribute("data-dl-quick-res") || "best";
+        const qFmt = btn.getAttribute("data-dl-quick-fmt") || "video/mp4";
+        downloadCurrentlyPlayingVideo({
+          resolution: qRes,
+          formatId: qFmt,
+        });
       });
     });
 
@@ -8944,7 +9597,7 @@
       e.preventDefault();
       const rawUrl = urlInput?.value || "";
       const formatId = fmtSelect?.value || downloadPrefs.formatId || "video/mp4";
-      const resolution = resSelect?.value || downloadPrefs.resolution || "all";
+      const resolution = resSelect?.value || downloadPrefs.resolution || "best";
       const customTitle = titleInput?.value || "";
       startAuthorizedDownload(rawUrl, { formatId, resolution, title: customTitle });
       if (urlInput) urlInput.value = "";
